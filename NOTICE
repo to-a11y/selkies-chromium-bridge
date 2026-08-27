@@ -1,0 +1,34 @@
+Selkies Chromium Bridge
+
+This repository contains an independent Chromium integration layer built
+on top of the Selkies project.
+
+Upstream components used by the Docker build:
+
+Selkies
+https://github.com/selkies-project/selkies
+Revision:
+5b17d3ea6a39c759abd99b12e9250978dd3dd8a5
+License: Mozilla Public License 2.0
+
+pixelflux
+https://github.com/selkies-project/pixelflux
+Revision:
+40f01f7752370b3c6962671ca282a4f32456e72d
+License: Mozilla Public License 2.0
+
+pcmflux
+https://github.com/selkies-project/pcmflux
+Revision:
+c5487f28b71e5f82211f21b08a8b84c9e08fa48f
+License: Mozilla Public License 2.0
+
+The default pixelflux build uses libx264 as its software H.264 encoder.
+libx264 is GPL-2.0-or-later. pixelflux also supports a GPL-free build
+using OpenH264 when PIXELFLUX_ENABLE_GPL=0.
+
+Additional software installed by the Docker image, including Ubuntu,
+Google Chrome, FFmpeg libraries, PulseAudio, Openbox, nginx and their
+dependencies, remains subject to its respective licenses.
+
+This repository does not claim ownership of any upstream project.

@@ -1,0 +1,43 @@
+services:
+  browser:
+    build:
+      context: .
+      args:
+        SELKIES_REF: ${SELKIES_REF}
+        PIXELFLUX_REF: ${PIXELFLUX_REF}
+        PCMFLUX_REF: ${PCMFLUX_REF}
+
+    shm_size: "1gb"
+    restart: unless-stopped
+
+    volumes:
+      - ./runtime/chrome-profile:/data/chrome-profile
+
+    expose:
+      - "8080"
+      - "9231"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9231/health | grep -q '\"ok\": true'"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  gateway:
+    image: nginx:alpine
+    restart: unless-stopped
+
+    depends_on:
+      browser:
+        condition: service_healthy
+
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8080}:80"
+
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro

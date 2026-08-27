@@ -1,0 +1,39 @@
+# Runtime data
+runtime/
+chrome-profile/
+data/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+.htpasswd*
+credentials*
+
+# Browser state
+SingletonLock
+SingletonSocket
+SingletonCookie
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build/output
+*.whl
+*.tar
+*.tar.gz
+dist/
+build/
+
+# Backup/editor
+*.bak
+*.bak-*
+*~
+.vscode/
+.idea/
+.DS_Store
