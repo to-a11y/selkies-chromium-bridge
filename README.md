@@ -11,8 +11,10 @@ browser, especially for file uploads and downloads.
 
 Remote Chromium file upload using the local native file picker.
 
-Video:
 https://github.com/user-attachments/assets/29881aa0-1274-4a53-a6b1-a3f6efed959a
+
+If the embedded video does not play:
+<a href="https://github.com/user-attachments/assets/29881aa0-1274-4a53-a6b1-a3f6efed959a">Open the demo video directly</a>
 
 ## Why
 
