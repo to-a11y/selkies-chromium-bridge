@@ -9,8 +9,9 @@ browser, especially for file uploads and downloads.
 
 ## Demo
 
-Remote Chromium file upload using the local native file picker:
-https://github.com/user-attachments/assets/c137358f-5b82-4195-ba86-b9526916b6ba
+[Watch the demo video](https://github.com/user-attachments/assets/c137358f-5b82-4195-ba86-b9526916b6ba)
+
+Remote Chromium file upload using the local native file picker.
 
 ## Why
 
