@@ -1,3 +1,4 @@
+
 # Selkies Chromium Bridge
 
 A Chromium integration layer for
@@ -5,6 +6,11 @@ A Chromium integration layer for
 
 It makes a streamed remote Chromium session behave more like a local
 browser, especially for file uploads and downloads.
+
+## Demo
+
+Remote Chromium file upload using the local native file picker:
+https://github.com/user-attachments/assets/52acd1fe-7b8b-49c5-849f-3aaf13c59db9
 
 ## Why
 
