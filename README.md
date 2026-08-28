@@ -10,7 +10,7 @@ browser, especially for file uploads and downloads.
 ## Demo
 
 Remote Chromium file upload using the local native file picker:
-https://github.com/user-attachments/assets/52acd1fe-7b8b-49c5-849f-3aaf13c59db9
+https://github.com/user-attachments/assets/c137358f-5b82-4195-ba86-b9526916b6ba
 
 ## Why
 
