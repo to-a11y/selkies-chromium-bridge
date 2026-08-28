@@ -135,7 +135,7 @@ require a secure browser context.
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR-USER/selkies-chromium-bridge.git
+git clone https://github.com/to-a11y/selkies-chromium-bridge.git
 cd selkies-chromium-bridge
 ```
 
