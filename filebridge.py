@@ -7,7 +7,8 @@ import time
 import uuid
 import secrets
 import mimetypes
-from urllib.parse import quote
+import shutil
+from urllib.parse import quote, urlsplit
 from pathlib import Path
 
 from aiohttp import web, ClientSession, WSMsgType
@@ -16,6 +17,7 @@ from aiohttp import web, ClientSession, WSMsgType
 CDP_LIST = "http://127.0.0.1:9222/json/list"
 UPLOAD_ROOT = Path("/tmp/filebridge")
 UPLOAD_TTL = 30 * 60
+PENDING_TTL = 2 * 60
 
 #
 # -------------------------------------------------------
@@ -38,6 +40,10 @@ DOWNLOAD_ROOT.mkdir(
     parents=True,
     exist_ok=True
 )
+
+# Temporary browser files are private to this service.
+UPLOAD_ROOT.chmod(0o700)
+DOWNLOAD_ROOT.chmod(0o700)
 
 clients = set()
 connections = {}
@@ -167,6 +173,7 @@ async def target_worker(target, session):
                         continue
 
                     item = {
+                        "id": secrets.token_urlsafe(16),
                         "target_id": tid,
                         "backend_node_id":
                             backend_node_id,
@@ -189,6 +196,7 @@ async def target_worker(target, session):
 
                     await broadcast({
                         "type": "choose",
+                        "id": item["id"],
                         "mode": item["mode"]
                     })
 
@@ -498,44 +506,53 @@ async def browser_download_worker():
                                 continue
 
                             #
-                            # Chrome normally returns filePath
-                            # here. allowAndName also guarantees
-                            # GUID as the disk filename.
+                            # Browser.setDownloadBehavior uses
+                            # allowAndName, so the expected file is
+                            # DOWNLOAD_ROOT/<guid>.
                             #
-                            raw_path = (
-                                params.get(
-                                    "filePath"
+                            # Do not trust a filePath supplied by a
+                            # CDP event. Resolve the expected path and
+                            # make sure it stays inside DOWNLOAD_ROOT.
+                            #
+                            try:
+                                root_path = (
+                                    DOWNLOAD_ROOT.resolve()
                                 )
-                                or str(
+                                file_path = (
                                     DOWNLOAD_ROOT /
                                     guid
+                                ).resolve()
+                            except Exception as exc:
+                                download_active.pop(
+                                    guid,
+                                    None
                                 )
-                            )
+                                log(
+                                    "download ERROR "
+                                    "invalid path "
+                                    f"guid={guid} "
+                                    f"error={exc}"
+                                )
+                                continue
 
-                            file_path = Path(
-                                raw_path
-                            )
+                            if file_path.parent != root_path:
+                                download_active.pop(
+                                    guid,
+                                    None
+                                )
+                                log(
+                                    "download ERROR "
+                                    "path escaped download root "
+                                    f"guid={guid}"
+                                )
+                                continue
 
                             #
                             # Small grace period: completed event
                             # can race filesystem visibility.
                             #
                             for _ in range(50):
-
-                                if (
-                                    file_path.is_file()
-                                ):
-                                    break
-
-                                fallback = (
-                                    DOWNLOAD_ROOT /
-                                    guid
-                                )
-
-                                if fallback.is_file():
-                                    file_path = (
-                                        fallback
-                                    )
+                                if file_path.is_file():
                                     break
 
                                 await asyncio.sleep(
@@ -549,6 +566,10 @@ async def browser_download_worker():
                                     "completed file missing "
                                     f"guid={guid} "
                                     f"path={file_path}"
+                                )
+                                download_active.pop(
+                                    guid,
+                                    None
                                 )
 
                                 continue
@@ -575,7 +596,9 @@ async def browser_download_worker():
                                     filename,
 
                                 "created":
-                                    time.time()
+                                    time.time(),
+                                "used":
+                                    False
                             }
 
                             download_active.pop(
@@ -648,6 +671,14 @@ async def download_handler(
         raise web.HTTPNotFound(
             text="Download expired or not found"
         )
+
+    # A download capability is valid only once.
+    if item.get("used"):
+        raise web.HTTPNotFound(
+            text="Download expired or already used"
+        )
+
+    item["used"] = True
 
     path = Path(
         item["path"]
@@ -829,194 +860,356 @@ def safe_filename(name):
     name = name.split("/")[-1]
     name = name.replace("\x00", "")
 
-    if not name:
+    if not name or name in (".", ".."):
         name = "upload"
 
     return name[:240]
 
 
+
+def request_has_same_origin(request):
+    """
+    Require the browser Origin to match the public origin that
+    reached the reverse proxy.
+
+    The public port is taken dynamically from the Host header, so
+    deployments may use 443, 4025, 8443, or any other port.
+    """
+    origin = request.headers.get("Origin", "")
+    host = request.headers.get("Host", "")
+
+    forwarded_proto = request.headers.get(
+        "X-Forwarded-Proto",
+        ""
+    )
+
+    if forwarded_proto:
+        public_scheme = (
+            forwarded_proto
+            .split(",", 1)[0]
+            .strip()
+            .lower()
+        )
+    else:
+        public_scheme = request.scheme.lower()
+
+    if (
+        not origin or
+        not host or
+        public_scheme not in ("http", "https")
+    ):
+        return False
+
+    try:
+        parsed_origin = urlsplit(origin)
+        parsed_host = urlsplit(
+            f"{public_scheme}://{host}"
+        )
+
+        origin_host = parsed_origin.hostname
+        request_host = parsed_host.hostname
+
+        if (
+            not origin_host or
+            not request_host
+        ):
+            return False
+
+        if parsed_origin.scheme.lower() != public_scheme:
+            return False
+
+        def effective_port(parsed, scheme):
+            if parsed.port is not None:
+                return parsed.port
+
+            return 443 if scheme == "https" else 80
+
+        origin_port = effective_port(
+            parsed_origin,
+            parsed_origin.scheme.lower()
+        )
+
+        request_port = effective_port(
+            parsed_host,
+            public_scheme
+        )
+
+    except (ValueError, TypeError):
+        return False
+
+    return (
+        origin_host.lower() ==
+        request_host.lower()
+        and
+        origin_port ==
+        request_port
+    )
+
+
+def require_same_origin(request):
+    if not request_has_same_origin(request):
+        log(
+            "rejected request with invalid Origin "
+            f"origin={request.headers.get('Origin')!r} "
+            f"host={request.headers.get('Host')!r}"
+        )
+        raise web.HTTPForbidden(
+            text="Invalid request origin"
+        )
+
+
+
 async def upload_handler(request):
     global pending
 
+    require_same_origin(request)
+
+    chooser_id = request.headers.get(
+        "X-FileBridge-Chooser",
+        ""
+    )
+
+    now = time.time()
+
+    #
+    # Atomically claim the chooser.
+    #
+    # Once pending becomes None, a second concurrent POST cannot
+    # use the same remote input.
+    #
     async with pending_lock:
-        current = (
-            dict(pending)
-            if pending
-            else None
-        )
-
-    if not current:
-        return web.json_response(
-            {
-                "ok": False,
-                "error":
-                    "No pending remote file chooser"
-            },
-            status=409
-        )
-
-    reader = await request.multipart()
-
-    batch = (
-        UPLOAD_ROOT /
-        uuid.uuid4().hex
-    )
-
-    batch.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    paths = []
-    names = []
-    index = 0
-
-    while True:
-        part = await reader.next()
-
-        if part is None:
-            break
-
         if (
-            part.name != "files" or
-            not part.filename
+            pending is not None and
+            now - pending.get("time", 0) >
+                PENDING_TTL
         ):
-            continue
-
-        original_name = safe_filename(
-            part.filename
-        )
-
-        item_dir = (
-            batch /
-            str(index)
-        )
-
-        item_dir.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        if original_name.isascii():
-            disk_name = original_name
-        else:
-            suffix = Path(
-                original_name
-            ).suffix
-
-            if (
-                not suffix.isascii() or
-                len(suffix) > 16
-            ):
-                suffix = ""
-
-            disk_name = (
-                "rbi-upload-"
-                + uuid.uuid4().hex[:10]
-                + suffix
+            log(
+                "expired pending file chooser "
+                f"id={pending.get('id', '')[:8]}"
             )
-
-        dest = item_dir / disk_name
-
-        size = 0
-
-        with dest.open("wb") as fp:
-            while True:
-                chunk = await part.read_chunk(
-                    size=1024 * 1024
-                )
-
-                if not chunk:
-                    break
-
-                fp.write(chunk)
-                size += len(chunk)
-
-        paths.append(
-            str(dest)
-        )
-
-        names.append(original_name)
-
-        log(
-            f"uploaded local file "
-            f"original={original_name!r} "
-            f"disk={disk_name!r} "
-            f"bytes={size}"
-        )
-
-        index += 1
-
-    if not paths:
-        return web.json_response(
-            {
-                "ok": False,
-                "error": "No files received"
-            },
-            status=400
-        )
-
-    if (
-        current["mode"] ==
-        "selectSingle"
-    ):
-        paths = paths[:1]
-        names = names[:1]
-
-    conn = connections.get(
-        current["target_id"]
-    )
-
-    if conn is None:
-        return web.json_response(
-            {
-                "ok": False,
-                "error":
-                    "Remote page target disappeared"
-            },
-            status=409
-        )
-
-    await conn.send(
-        "DOM.setFileInputFiles",
-        {
-            "files": paths,
-            "backendNodeId":
-                current[
-                    "backend_node_id"
-                ]
-        }
-    )
-
-    async with pending_lock:
-        if (
-            pending and
-            pending.get("target_id") ==
-                current["target_id"] and
-            pending.get(
-                "backend_node_id"
-            ) ==
-                current[
-                    "backend_node_id"
-                ]
-        ):
             pending = None
 
-    asyncio.create_task(
-        cleanup_batch(batch)
-    )
+        if pending is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error":
+                        "No pending remote file chooser"
+                },
+                status=409
+            )
 
-    log(
-        "setFileInputFiles: " +
-        ", ".join(names)
-    )
+        expected_id = str(
+            pending.get("id", "")
+        )
 
-    return web.json_response(
-        {
-            "ok": True,
-            "files": names
-        }
-    )
+        if (
+            not chooser_id or
+            not secrets.compare_digest(
+                expected_id,
+                chooser_id
+            )
+        ):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error":
+                        "Remote file chooser changed "
+                        "or expired"
+                },
+                status=409
+            )
+
+        current = dict(pending)
+        pending = None
+
+    batch = None
+    keep_batch = False
+
+    try:
+        reader = await request.multipart()
+
+        batch = (
+            UPLOAD_ROOT /
+            uuid.uuid4().hex
+        )
+        batch.mkdir(
+            parents=True,
+            exist_ok=True,
+            mode=0o700
+        )
+
+        paths = []
+        names = []
+        index = 0
+
+        while True:
+            part = await reader.next()
+
+            if part is None:
+                break
+
+            if (
+                part.name != "files" or
+                not part.filename
+            ):
+                continue
+
+            original_name = safe_filename(
+                part.filename
+            )
+
+            item_dir = (
+                batch /
+                str(index)
+            )
+            item_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700
+            )
+
+            if original_name.isascii():
+                disk_name = original_name
+            else:
+                suffix = Path(
+                    original_name
+                ).suffix
+
+                if (
+                    not suffix.isascii() or
+                    len(suffix) > 16
+                ):
+                    suffix = ""
+
+                disk_name = (
+                    "rbi-upload-"
+                    + uuid.uuid4().hex[:10]
+                    + suffix
+                )
+
+            dest = item_dir / disk_name
+
+            size = 0
+
+            with dest.open("wb") as fp:
+                while True:
+                    chunk = await part.read_chunk(
+                        size=1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    fp.write(chunk)
+                    size += len(chunk)
+
+            paths.append(
+                str(dest)
+            )
+            names.append(
+                original_name
+            )
+
+            log(
+                "uploaded local file "
+                f"original={original_name!r} "
+                f"disk={disk_name!r} "
+                f"bytes={size}"
+            )
+
+            index += 1
+
+        if not paths:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "No files received"
+                },
+                status=400
+            )
+
+        if (
+            current["mode"] ==
+            "selectSingle"
+        ):
+            paths = paths[:1]
+            names = names[:1]
+
+        conn = connections.get(
+            current["target_id"]
+        )
+
+        if conn is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error":
+                        "Remote page target disappeared"
+                },
+                status=409
+            )
+
+        await conn.send(
+            "DOM.setFileInputFiles",
+            {
+                "files": paths,
+                "backendNodeId":
+                    current[
+                        "backend_node_id"
+                    ]
+            }
+        )
+
+        #
+        # The remote input has received the paths. Keep them
+        # available until the normal upload TTL expires.
+        #
+        keep_batch = True
+
+        asyncio.create_task(
+            cleanup_batch(batch)
+        )
+
+        log(
+            "setFileInputFiles: " +
+            ", ".join(names)
+        )
+
+        return web.json_response(
+            {
+                "ok": True,
+                "files": names
+            }
+        )
+
+    finally:
+        if not keep_batch:
+            #
+            # Any unsuccessful upload must leave no user files behind.
+            #
+            if batch is not None:
+                shutil.rmtree(
+                    batch,
+                    ignore_errors=True
+                )
+
+            #
+            # Permit a retry only when:
+            # - no newer chooser appeared;
+            # - the target still exists;
+            # - this chooser has not expired.
+            #
+            if (
+                current["target_id"] in connections and
+                time.time() -
+                    current.get("time", 0) <=
+                    PENDING_TTL
+            ):
+                async with pending_lock:
+                    if pending is None:
+                        pending = current
+
 
 
 FILEBRIDGE_JS = r'''
@@ -1144,6 +1337,10 @@ FILEBRIDGE_JS = r'''
             '/filebridge/upload',
             {
               method: 'POST',
+              headers: {
+                'X-FileBridge-Chooser':
+                  chooser?.id || ''
+              },
               body: form
             }
           );
@@ -1157,6 +1354,8 @@ FILEBRIDGE_JS = r'''
             `HTTP ${response.status}`
           );
         }
+
+        chooser = null;
 
         show(
           'Файл передан',
@@ -1362,6 +1561,8 @@ async def js_handler(request):
 
 
 async def ws_handler(request):
+    require_same_origin(request)
+
     ws = web.WebSocketResponse(
         heartbeat=30
     )
