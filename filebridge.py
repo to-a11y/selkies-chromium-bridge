@@ -172,26 +172,54 @@ async def target_worker(target, session):
                         )
                         continue
 
-                    item = {
-                        "id": secrets.token_urlsafe(16),
-                        "target_id": tid,
-                        "backend_node_id":
-                            backend_node_id,
-                        "mode":
-                            params.get(
-                                "mode",
-                                "selectSingle"
-                            ),
-                        "time": time.time()
-                    }
+                    mode = params.get(
+                        "mode",
+                        "selectSingle"
+                    )
+                    now = time.time()
+                    duplicate = False
 
                     async with pending_lock:
-                        pending = item
+                        if (
+                            pending
+                            and pending.get("target_id") == tid
+                            and pending.get("backend_node_id")
+                                == backend_node_id
+                            and pending.get("mode") == mode
+                            and now - pending.get("time", 0) < 2.0
+                        ):
+                            duplicate = True
+                            item = pending
+                        else:
+                            item = {
+                                "id": secrets.token_urlsafe(16),
+                                "target_id": tid,
+                                "backend_node_id":
+                                    backend_node_id,
+                                "mode": mode,
+                                "time": now
+                            }
+                            pending = item
+
+                    if duplicate:
+                        log(
+                            "duplicate file chooser ignored "
+                            f"mode={mode} "
+                            f"node={backend_node_id}"
+                        )
+                        continue
+
+                    age = (
+                        now - pending.get("time", 0)
+                        if pending else -1
+                    )
 
                     log(
                         "file chooser intercepted "
+                        f"target={tid[:8]} "
                         f"mode={item['mode']} "
-                        f"node={backend_node_id}"
+                        f"node={backend_node_id} "
+                        f"age={age:.3f}"
                     )
 
                     await broadcast({
@@ -964,9 +992,15 @@ async def upload_handler(request):
 
     require_same_origin(request)
 
-    chooser_id = request.headers.get(
-        "X-FileBridge-Chooser",
-        ""
+    chooser_id = (
+        request.query.get(
+            "chooser",
+            ""
+        )
+        or request.headers.get(
+            "X-FileBridge-Chooser",
+            ""
+        )
     )
 
     now = time.time()
@@ -1010,6 +1044,13 @@ async def upload_handler(request):
                 chooser_id
             )
         ):
+            log(
+                "chooser ID mismatch "
+                f"expected={expected_id[:8]!r} "
+                f"got={chooser_id[:8]!r} "
+                f"target={pending.get('target_id', '')[:8]} "
+                f"node={pending.get('backend_node_id')}"
+            )
             return web.json_response(
                 {
                     "ok": False,
@@ -1334,13 +1375,12 @@ FILEBRIDGE_JS = r'''
       try {
         const response =
           await fetch(
-            '/filebridge/upload',
+            '/filebridge/upload?chooser=' +
+              encodeURIComponent(
+                chooser?.id || ''
+              ),
             {
               method: 'POST',
-              headers: {
-                'X-FileBridge-Chooser':
-                  chooser?.id || ''
-              },
               body: form
             }
           );
