@@ -1,0 +1,54 @@
+--- a/addons/selkies-web-core/lib/input.js
++++ b/addons/selkies-web-core/lib/input.js
+@@ -1720,6 +1720,51 @@
+      * still streams to the remote desktop.
+      */
+     _handleKeyDown(event) {
++        /*
++         * Selkies Chromium Bridge:
++         * Ctrl/Cmd+P opens the LOCAL Print Preview Bridge
++         * instead of forwarding the chord to remote X11.
++         */
++        if (
++            (event.ctrlKey || event.metaKey) &&
++            !event.altKey &&
++            event.code === 'KeyP' &&
++            typeof window.__selkiesFileBridgePrint === 'function'
++        ) {
++            if (!this._guac_markEvent(event)) return;
++
++            /*
++             * Windows initially defers ControlLeft while it
++             * decides whether this is AltGr. Cancel that timer.
++             */
++            if (this._altGrArmed) {
++                this._altGrArmed = false;
++                clearTimeout(this._altGrTimeout);
++            }
++
++            /*
++             * If Ctrl was already forwarded to remote X11,
++             * release it so it cannot remain stuck there.
++             */
++            for (const code of ['ControlLeft', 'ControlRight']) {
++                if (code in this._keyDownList) {
++                    this._sendKeyEvent(
++                        this._keyDownList[code],
++                        code,
++                        false
++                    );
++                }
++            }
++
++            _stopEvent(event);
++
++            if (!event.repeat) {
++                window.__selkiesFileBridgePrint();
++            }
++
++            return;
++        }
++
+         if (event.ctrlKey && event.shiftKey) {
+             let hotkey = null;
+             if (event.code === 'KeyM' && !this.gamingMode) hotkey = this.onmenuhotkey;

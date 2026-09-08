@@ -32,6 +32,16 @@ RUN git clone \
     test "$(git rev-parse HEAD)" = "${SELKIES_REF}"
 
 
+# Selkies Chromium Bridge: reserve Ctrl/Cmd+P for the
+# local Print Preview Bridge before the web client is built.
+COPY patches/selkies-print-hotkey.patch \
+    /tmp/selkies-print-hotkey.patch
+
+RUN cd /src/selkies && \
+    git apply --check /tmp/selkies-print-hotkey.patch && \
+    git apply /tmp/selkies-print-hotkey.patch
+
+
 # ------------------------------------------------------------
 # SELKIES WEB CLIENT
 # ------------------------------------------------------------

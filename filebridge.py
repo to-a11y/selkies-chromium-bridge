@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -814,6 +815,294 @@ async def test_download_source(
     )
 
 
+#
+# -------------------------------------------------------
+# REMOTE PAGE -> LOCAL PRINT PREVIEW
+# -------------------------------------------------------
+#
+
+async def cdp_request(
+    ws_url,
+    method,
+    params=None
+):
+    """
+    Make one isolated CDP request to a page target.
+
+    A separate connection is used so print requests do not
+    interfere with FileBridge's long-lived target worker.
+    """
+
+    async with ClientSession() as session:
+        async with session.ws_connect(
+            ws_url,
+            max_msg_size=0
+        ) as ws:
+
+            command_id = 1
+
+            message = {
+                "id": command_id,
+                "method": method
+            }
+
+            if params is not None:
+                message["params"] = params
+
+            await ws.send_str(
+                json.dumps(message)
+            )
+
+            async for reply in ws:
+                if (
+                    reply.type !=
+                    WSMsgType.TEXT
+                ):
+                    continue
+
+                try:
+                    data = json.loads(
+                        reply.data
+                    )
+                except Exception:
+                    continue
+
+                if (
+                    data.get("id") !=
+                    command_id
+                ):
+                    continue
+
+                if "error" in data:
+                    raise RuntimeError(
+                        f"{method}: " +
+                        json.dumps(
+                            data["error"],
+                            ensure_ascii=False
+                        )
+                    )
+
+                return data.get(
+                    "result",
+                    {}
+                )
+
+    raise RuntimeError(
+        f"{method}: CDP connection closed"
+    )
+
+
+async def current_page_target():
+    """
+    Find the page that is currently visible/focused in the
+    remote Chromium window.
+
+    Focus is preferred. visibilityState=visible is the
+    fallback, followed by the first normal page target.
+    """
+
+    async with ClientSession() as session:
+        async with session.get(
+            CDP_LIST,
+            timeout=3
+        ) as response:
+            targets = await response.json()
+
+    pages = [
+        target
+        for target in targets
+        if (
+            target.get("type") == "page"
+            and
+            target.get(
+                "webSocketDebuggerUrl"
+            )
+        )
+    ]
+
+    if not pages:
+        raise RuntimeError(
+            "No remote page available"
+        )
+
+    visible = None
+
+    for target in pages:
+        try:
+            result = await cdp_request(
+                target[
+                    "webSocketDebuggerUrl"
+                ],
+                "Runtime.evaluate",
+                {
+                    "expression":
+                        """({
+                            focus:
+                                document.hasFocus(),
+                            visibility:
+                                document.visibilityState
+                        })""",
+                    "returnByValue": True
+                }
+            )
+
+            value = (
+                result
+                .get("result", {})
+                .get("value", {})
+            )
+
+            if value.get("focus"):
+                return target
+
+            if (
+                visible is None
+                and
+                value.get("visibility") ==
+                    "visible"
+            ):
+                visible = target
+
+        except Exception as exc:
+            log(
+                "print target probe "
+                f"failed "
+                f"id={target.get('id','')[:8]} "
+                f"error={exc}"
+            )
+
+    return visible or pages[0]
+
+
+async def prepare_print_job():
+    target = await current_page_target()
+
+    title = safe_filename(
+        target.get("title") or
+        "document"
+    )
+
+    if not title.lower().endswith(
+        ".pdf"
+    ):
+        filename = title + ".pdf"
+    else:
+        filename = title
+
+    log(
+        "print BEGIN "
+        f"target={target.get('id','')[:8]} "
+        f"url={target.get('url','')!r}"
+    )
+
+    result = await cdp_request(
+        target[
+            "webSocketDebuggerUrl"
+        ],
+        "Page.printToPDF",
+        {
+            "printBackground": True,
+            "displayHeaderFooter": False,
+
+            #
+            # A4 unless the site explicitly supplies
+            # its own @page size.
+            #
+            "paperWidth":
+                8.2677165354,
+
+            "paperHeight":
+                11.6929133858,
+
+            "preferCSSPageSize":
+                True
+        }
+    )
+
+    encoded = result.get(
+        "data",
+        ""
+    )
+
+    if not encoded:
+        raise RuntimeError(
+            "Page.printToPDF returned no data"
+        )
+
+    try:
+        pdf = base64.b64decode(
+            encoded,
+            validate=True
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid PDF data: {exc}"
+        )
+
+    if not pdf.startswith(
+        b"%PDF-"
+    ):
+        raise RuntimeError(
+            "Generated document is not a PDF"
+        )
+
+    file_path = (
+        DOWNLOAD_ROOT /
+        (
+            "print-" +
+            uuid.uuid4().hex +
+            ".pdf"
+        )
+    )
+
+    file_path.write_bytes(
+        pdf
+    )
+
+    token = secrets.token_urlsafe(
+        24
+    )
+
+    download_tokens[token] = {
+        "path":
+            str(file_path),
+
+        "filename":
+            filename,
+
+        "created":
+            time.time(),
+
+        "used":
+            False
+    }
+
+    asyncio.create_task(
+        cleanup_download(
+            token,
+            str(file_path)
+        )
+    )
+
+    log(
+        "print READY "
+        f"bytes={len(pdf)} "
+        f"name={filename!r} "
+        f"token={token[:8]}"
+    )
+
+    return {
+        "token":
+            token,
+
+        "filename":
+            filename,
+
+        "size":
+            len(pdf)
+    }
+
+
 async def discover_targets(app):
     async with ClientSession() as session:
         while True:
@@ -1311,6 +1600,38 @@ FILEBRIDGE_JS = r'''
   );
 
   let chooser = null;
+  let bridgeSocket = null;
+  let printWindow = null;
+
+  const printButton =
+    document.createElement(
+      'button'
+    );
+
+  printButton.textContent =
+    'Печать';
+
+  printButton.title =
+    'Подготовить текущую страницу к печати';
+
+  printButton.style.cssText = `
+    position:fixed;
+    right:16px;
+    top:16px;
+    z-index:2147483647;
+    padding:8px 14px;
+    border:1px solid rgba(0,0,0,.25);
+    border-radius:8px;
+    background:white;
+    color:#222;
+    font:14px sans-serif;
+    cursor:pointer;
+    box-shadow:0 3px 12px rgba(0,0,0,.25);
+  `;
+
+  document.documentElement.appendChild(
+    printButton
+  );
 
   function show(
     text,
@@ -1333,6 +1654,94 @@ FILEBRIDGE_JS = r'''
         'none';
     }, 1200);
   }
+
+  printButton.addEventListener(
+    'click',
+    () => {
+      if (
+        !bridgeSocket ||
+        bridgeSocket.readyState !==
+          WebSocket.OPEN
+      ) {
+        show(
+          'PrintBridge не подключён',
+          false
+        );
+
+        hideLater();
+        return;
+      }
+
+      /*
+       * Open the local tab immediately while this
+       * click still has user activation. The PDF
+       * will replace it after the server finishes.
+       */
+      const w =
+        window.open(
+          'about:blank',
+          '_blank'
+        );
+
+      if (!w) {
+        show(
+          'Разрешите всплывающие окна',
+          false
+        );
+
+        hideLater();
+        return;
+      }
+
+      printWindow = w;
+
+      try {
+        w.document.open();
+
+        w.document.write(`
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Preparing print preview</title>
+          </head>
+          <body style="
+            font-family:sans-serif;
+            padding:40px
+          ">
+            Подготовка документа…
+          </body>
+          </html>
+        `);
+
+        w.document.close();
+
+      } catch (_) {}
+
+      bridgeSocket.send(
+        JSON.stringify({
+          type:
+            'printCurrentPage'
+        })
+      );
+
+      show(
+        'Подготовка к печати…',
+        false
+      );
+    }
+  );
+
+
+  /*
+   * Called synchronously by the Selkies keyboard handler
+   * for Ctrl+P. Reuse the already-tested Print button path.
+   */
+  window.__selkiesFileBridgePrint =
+    () => {
+      printButton.click();
+    };
+
 
   function openPicker() {
     picker.value = '';
@@ -1424,6 +1833,8 @@ FILEBRIDGE_JS = r'''
         `${proto}//${location.host}/filebridge/ws`
       );
 
+    bridgeSocket = ws;
+
     ws.addEventListener(
       'message',
       event => {
@@ -1437,6 +1848,145 @@ FILEBRIDGE_JS = r'''
         } catch (_) {
           return;
         }
+
+        /*
+         * -----------------------------------------------
+         * REMOTE PAGE -> LOCAL PRINT PREVIEW
+         * -----------------------------------------------
+         */
+
+        if (
+          msg.type ===
+          'printReady'
+        ) {
+          const targetWindow =
+            printWindow;
+
+          printWindow = null;
+
+          (async () => {
+            try {
+              const response =
+                await fetch(
+                  '/filebridge/download/' +
+                  encodeURIComponent(
+                    msg.token
+                  ),
+                  {
+                    cache:
+                      'no-store'
+                  }
+                );
+
+              if (!response.ok) {
+                throw new Error(
+                  `HTTP ${response.status}`
+                );
+              }
+
+              const blob =
+                await response.blob();
+
+              const file =
+                new File(
+                  [blob],
+                  msg.filename ||
+                    'document.pdf',
+                  {
+                    type:
+                      'application/pdf'
+                  }
+                );
+
+              const objectUrl =
+                URL.createObjectURL(
+                  file
+                );
+
+              if (
+                targetWindow &&
+                !targetWindow.closed
+              ) {
+                targetWindow.location.href =
+                  objectUrl;
+              } else {
+                window.open(
+                  objectUrl,
+                  '_blank'
+                );
+              }
+
+              show(
+                'Документ готов',
+                false
+              );
+
+              hideLater();
+
+              console.log(
+                '[filebridge] LOCAL PRINT PREVIEW',
+                msg.filename,
+                objectUrl
+              );
+
+            } catch (error) {
+              show(
+                `Ошибка печати: ${
+                  error.message
+                }`,
+                false
+              );
+
+              if (
+                targetWindow &&
+                !targetWindow.closed
+              ) {
+                try {
+                  targetWindow.document.body
+                    .textContent =
+                      'Ошибка подготовки документа: ' +
+                      error.message;
+                } catch (_) {}
+              }
+            }
+          })();
+
+          return;
+        }
+
+
+        if (
+          msg.type ===
+          'printError'
+        ) {
+          show(
+            `Ошибка печати: ${
+              msg.error ||
+              'unknown error'
+            }`,
+            false
+          );
+
+          if (
+            printWindow &&
+            !printWindow.closed
+          ) {
+            try {
+              printWindow.document.body
+                .textContent =
+                  'Ошибка подготовки документа: ' +
+                  (
+                    msg.error ||
+                    'unknown error'
+                  );
+            } catch (_) {}
+          }
+
+          printWindow = null;
+
+          return;
+        }
+
 
         /*
          * -----------------------------------------------
@@ -1573,6 +2123,12 @@ FILEBRIDGE_JS = r'''
     ws.addEventListener(
       'close',
       () => {
+        if (
+          bridgeSocket === ws
+        ) {
+          bridgeSocket = null;
+        }
+
         setTimeout(
           connect,
           1000
@@ -1617,8 +2173,50 @@ async def ws_handler(request):
     )
 
     try:
-        async for _ in ws:
-            pass
+        async for message in ws:
+            if (
+                message.type !=
+                WSMsgType.TEXT
+            ):
+                continue
+
+            try:
+                data = json.loads(
+                    message.data
+                )
+            except Exception:
+                continue
+
+            if (
+                data.get("type") ==
+                "printCurrentPage"
+            ):
+                try:
+                    item = (
+                        await prepare_print_job()
+                    )
+
+                    await ws.send_json({
+                        "type":
+                            "printReady",
+
+                        **item
+                    })
+
+                except Exception as exc:
+                    log(
+                        "print ERROR "
+                        f"{exc}"
+                    )
+
+                    await ws.send_json({
+                        "type":
+                            "printError",
+
+                        "error":
+                            str(exc)
+                    })
+
     finally:
         clients.discard(ws)
 
