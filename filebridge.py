@@ -20,6 +20,61 @@ UPLOAD_ROOT = Path("/tmp/filebridge")
 UPLOAD_TTL = 30 * 60
 PENDING_TTL = 2 * 60
 
+
+REMOTE_PRINT_BINDING = (
+    "__selkiesRemotePrint"
+)
+
+REMOTE_PRINT_HOOK = r"""
+(() => {
+  if (
+    window.__selkiesRemotePrintHook
+  ) {
+    return;
+  }
+
+  Object.defineProperty(
+    window,
+    "__selkiesRemotePrintHook",
+    {
+      value: true,
+      configurable: false
+    }
+  );
+
+  const bridgePrint =
+    function () {
+      try {
+        window.__selkiesRemotePrint(
+          "print"
+        );
+      } catch (_) {}
+
+      /*
+       * window.print() normally returns undefined.
+       */
+      return undefined;
+    };
+
+  try {
+    Object.defineProperty(
+      window,
+      "print",
+      {
+        value: bridgePrint,
+        configurable: true,
+        writable: true
+      }
+    );
+  } catch (_) {
+    try {
+      window.print =
+        bridgePrint;
+    } catch (_) {}
+  }
+})();
+"""
+
 #
 # -------------------------------------------------------
 # REMOTE DOWNLOAD -> LOCAL BROWSER
@@ -49,6 +104,13 @@ DOWNLOAD_ROOT.chmod(0o700)
 clients = set()
 connections = {}
 target_tasks = {}
+
+#
+# Native Chromium Print Preview targets already seen.
+# Used only to avoid sending the same print request twice
+# while chrome://print/ is disappearing.
+#
+native_print_targets = set()
 
 download_active = {}
 download_tokens = {}
@@ -122,6 +184,48 @@ async def target_worker(target, session):
             await conn.send("Page.enable")
             await conn.send("DOM.enable")
 
+
+            #
+            # ---------------------------------------------------
+            # REMOTE window.print() -> LOCAL PrintBridge signal
+            # ---------------------------------------------------
+            #
+
+            await conn.send(
+                "Runtime.enable"
+            )
+
+            await conn.send(
+                "Runtime.addBinding",
+                {
+                    "name":
+                        REMOTE_PRINT_BINDING
+                }
+            )
+
+            #
+            # Future documents / navigations.
+            #
+            await conn.send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source":
+                        REMOTE_PRINT_HOOK
+                }
+            )
+
+            #
+            # The page may already be loaded by the time
+            # FileBridge attaches to its target.
+            #
+            await conn.send(
+                "Runtime.evaluate",
+                {
+                    "expression":
+                        REMOTE_PRINT_HOOK
+                }
+            )
+
             await conn.send(
                 "Page.setInterceptFileChooserDialog",
                 {
@@ -152,6 +256,32 @@ async def target_worker(target, session):
                         )
                     )
                     continue
+
+                if (
+                    data.get("method") ==
+                    "Runtime.bindingCalled"
+                ):
+                    params = data.get(
+                        "params",
+                        {}
+                    )
+
+                    if (
+                        params.get("name") ==
+                        REMOTE_PRINT_BINDING
+                    ):
+                        log(
+                            "remote window.print "
+                            f"target={tid[:8]}"
+                        )
+
+                        await broadcast({
+                            "type":
+                                "remotePrintRequested"
+                        })
+
+                        continue
+
 
                 if (
                     data.get("method") ==
@@ -917,6 +1047,12 @@ async def current_page_target():
             target.get(
                 "webSocketDebuggerUrl"
             )
+            and
+            not str(
+                target.get("url") or ""
+            ).startswith(
+                "chrome://print"
+            )
         )
     ]
 
@@ -1103,6 +1239,89 @@ async def prepare_print_job():
     }
 
 
+async def browser_cdp_request(
+    method,
+    params=None
+):
+    """
+    Send one command to Chromium's browser-level
+    DevTools target.
+    """
+
+    async with ClientSession() as session:
+        async with session.get(
+            "http://127.0.0.1:9222/json/version",
+            timeout=3
+        ) as response:
+            info = await response.json()
+
+        ws_url = info.get(
+            "webSocketDebuggerUrl"
+        )
+
+        if not ws_url:
+            raise RuntimeError(
+                "Browser CDP websocket not found"
+            )
+
+        async with session.ws_connect(
+            ws_url,
+            max_msg_size=0
+        ) as ws:
+
+            command_id = 1
+
+            message = {
+                "id": command_id,
+                "method": method
+            }
+
+            if params is not None:
+                message["params"] = params
+
+            await ws.send_str(
+                json.dumps(message)
+            )
+
+            async for reply in ws:
+                if (
+                    reply.type !=
+                    WSMsgType.TEXT
+                ):
+                    continue
+
+                try:
+                    data = json.loads(
+                        reply.data
+                    )
+                except Exception:
+                    continue
+
+                if (
+                    data.get("id") !=
+                    command_id
+                ):
+                    continue
+
+                if "error" in data:
+                    raise RuntimeError(
+                        f"{method}: " +
+                        json.dumps(
+                            data["error"],
+                            ensure_ascii=False
+                        )
+                    )
+
+                return data.get(
+                    "result",
+                    {}
+                )
+
+    raise RuntimeError(
+        f"{method}: browser CDP closed"
+    )
+
+
 async def discover_targets(app):
     async with ClientSession() as session:
         while True:
@@ -1113,6 +1332,20 @@ async def discover_targets(app):
                 ) as response:
                     targets = await response.json()
 
+                current_target_ids = {
+                    target.get("id")
+                    for target in targets
+                    if target.get("id")
+                }
+
+                #
+                # Forget previews which have disappeared so
+                # this set cannot grow indefinitely.
+                #
+                native_print_targets.intersection_update(
+                    current_target_ids
+                )
+
                 for target in targets:
                     if target.get("type") != "page":
                         continue
@@ -1120,6 +1353,131 @@ async def discover_targets(app):
                     tid = target.get("id")
 
                     if not tid:
+                        continue
+
+                    target_url = str(
+                        target.get("url") or ""
+                    )
+
+                    #
+                    # ------------------------------------------------
+                    # NATIVE CHROMIUM PRINT PREVIEW
+                    # ------------------------------------------------
+                    #
+                    # Context menu -> Print does not execute
+                    # window.print() and does not travel through
+                    # Selkies Ctrl+P handling.
+                    #
+                    # Chromium creates a separate chrome://print/
+                    # page target instead. Detect that target, close
+                    # the REMOTE Linux preview, and ask the LOCAL
+                    # Print Preview Bridge to take over.
+                    #
+                    if target_url.startswith(
+                        "chrome://print"
+                    ):
+                        if (
+                            tid not in
+                            native_print_targets
+                        ):
+                            native_print_targets.add(
+                                tid
+                            )
+
+                            log(
+                                "native Chrome print "
+                                f"target={tid[:8]}"
+                            )
+
+                            try:
+                                ws_url = target.get(
+                                    "webSocketDebuggerUrl"
+                                )
+
+                                if not ws_url:
+                                    raise RuntimeError(
+                                        "print target has no CDP websocket"
+                                    )
+
+                                #
+                                # Do NOT forcibly destroy chrome://print.
+                                #
+                                # Chrome Print Preview is a tab-modal UI.
+                                # Killing its WebContents with
+                                # Target.closeTarget can leave the modal
+                                # host behind as a blank white overlay.
+                                #
+                                # Escape follows Chromium's normal Cancel
+                                # path and closes both preview and modal.
+                                #
+                                await cdp_request(
+                                    ws_url,
+                                    "Input.dispatchKeyEvent",
+                                    {
+                                        "type":
+                                            "rawKeyDown",
+
+                                        "key":
+                                            "Escape",
+
+                                        "code":
+                                            "Escape",
+
+                                        "windowsVirtualKeyCode":
+                                            27,
+
+                                        "nativeVirtualKeyCode":
+                                            27
+                                    }
+                                )
+
+                                await cdp_request(
+                                    ws_url,
+                                    "Input.dispatchKeyEvent",
+                                    {
+                                        "type":
+                                            "keyUp",
+
+                                        "key":
+                                            "Escape",
+
+                                        "code":
+                                            "Escape",
+
+                                        "windowsVirtualKeyCode":
+                                            27,
+
+                                        "nativeVirtualKeyCode":
+                                            27
+                                    }
+                                )
+
+                                log(
+                                    "native Chrome print "
+                                    f"cancelled target={tid[:8]} "
+                                    "via Escape"
+                                )
+
+                            except Exception as exc:
+                                log(
+                                    "native Chrome print "
+                                    "cancel ERROR "
+                                    f"target={tid[:8]} "
+                                    f"error={exc}"
+                                )
+
+                            await broadcast({
+                                "type":
+                                    "remotePrintRequested",
+
+                                "source":
+                                    "chromePrintPreview"
+                            })
+
+                        #
+                        # Never attach the normal FileBridge worker
+                        # to chrome://print/.
+                        #
                         continue
 
                     task = target_tasks.get(tid)
@@ -1983,6 +2341,76 @@ FILEBRIDGE_JS = r'''
           }
 
           printWindow = null;
+
+          return;
+        }
+
+
+        /*
+         * -----------------------------------------------
+         * REMOTE window.print()
+         * -----------------------------------------------
+         */
+
+        if (
+          msg.type ===
+          'remotePrintRequested'
+        ) {
+          /*
+           * Do not invoke printButton.click()
+           * programmatically here.
+           *
+           * The remote request arrived asynchronously,
+           * so the LOCAL browser may no longer consider
+           * this a user gesture and may block window.open.
+           *
+           * Instead make the already-working Print button
+           * visually obvious. The user's click then has
+           * genuine local user activation.
+           */
+          const normalText =
+            'Печать';
+
+          printButton.textContent =
+            (
+              msg.source ===
+                'chromePrintPreview'
+            )
+              ? 'Печать — запрос Chrome'
+              : 'Печать — запрос сайта';
+
+          printButton.style.outline =
+            '3px solid currentColor';
+
+          printButton.style.outlineOffset =
+            '3px';
+
+          if (
+            printButton.__requestTimer
+          ) {
+            clearTimeout(
+              printButton.__requestTimer
+            );
+          }
+
+          printButton.__requestTimer =
+            setTimeout(
+              () => {
+                printButton.textContent =
+                  normalText;
+
+                printButton.style.outline =
+                  '';
+
+                printButton.style.outlineOffset =
+                  '';
+              },
+              8000
+            );
+
+          console.log(
+            '[filebridge] remote window.print requested'
+          );
 
           return;
         }
